@@ -5,6 +5,7 @@ const Joi = require('joi');
 
 const {
   getInventory,
+  getWarehouseInventoryById, // Added this
   createWarehouseInventory,
   createWarehouseInventoryBulk,
   updateInventoryItem,
@@ -14,7 +15,9 @@ const {
   getCategories,
   getInventoryByFacilityId,
   getInventoryByUserId,
-  createInventoryFacility
+  createInventoryFacility,
+  bulkImportInventory,
+  manualEntryInventory
 } = require('../controllers/inventoryController');
 
 const router = express.Router();
@@ -35,7 +38,7 @@ router.get('/:id/movements', getStockMovements);
 router.get('/', getInventory);
 
 // ✅ Get single inventory item by ID
-router.get('/:id', getInventory);
+router.get('/:id', getWarehouseInventoryById);
 
 // ✅ Create single or multiple warehouse inventory items
 
@@ -45,6 +48,12 @@ router.get('/:id', getInventory);
 router.post('/create', createWarehouseInventory);
 
 router.post('/createBulk', createWarehouseInventoryBulk);
+
+// ✅ CSV/Excel Bulk Import
+router.post('/bulk-import', bulkImportInventory);
+
+// ✅ Manual Entry for External Procurement
+router.post('/manual-entry', manualEntryInventory);
 
 // ✅ Update inventory item
 router.put('/:id', updateInventoryItem);

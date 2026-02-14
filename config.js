@@ -5,7 +5,7 @@ const cloudinary = require('cloudinary').v2;
 const dbConfig = {
   host: process.env.DB_HOST || 'switchback.proxy.rlwy.net',
   user: process.env.DB_USER || 'root',
-  password:  'wvtbWVozAzPoLzIWnQeuMGFpEmHMdkbv',
+  password: 'wvtbWVozAzPoLzIWnQeuMGFpEmHMdkbv',
   database: process.env.DB_NAME || 'railway',
   port: process.env.DB_PORT || 56348,
   waitForConnections: true,
@@ -13,8 +13,7 @@ const dbConfig = {
   queueLimit: 0,
   acquireTimeout: 60000,
   timeout: 60000
-}; 
-
+};
 
 // Create connection pool
 const pool = mysql.createPool(dbConfig);

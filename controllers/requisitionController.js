@@ -145,53 +145,93 @@ const getRequisitions = async (req, res) => {
       error: error.message
     });
   }
-};      
-// Get requisition by ID
+};
+// Get requisition by ID with complete item details
 const getRequisitionById = async (req, res) => {
+  const connection = await pool.getConnection();
   try {
     const { id } = req.params;
+    
+    // Validate and parse ID
+    const requisitionId = parseInt(id, 10);
+    if (isNaN(requisitionId) || requisitionId <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid requisition ID'
+      });
+    }
 
-    let query = `
-      SELECT r.*, 
-             u.name as user_name, u.email as user_email, u.phone as user_phone,
-             f.name as facility_name, f.location as facility_location
-      FROM requisitions r
-      LEFT JOIN users u ON r.user_id = u.id
-      LEFT JOIN facilities f ON r.facility_id = f.id
-      WHERE r.id = ?
-    `;
-
-    const queryParams = [id];
-
-    // Role-based access control
-    // if (req.user.role === 'facility_admin') {
-    //   query += ' AND r.facility_id = ?';
-    //   queryParams.push(req.user.facility_id);
-    // } else if (req.user.role === 'facility_user') {
-    //   query += ' AND r.user_id = ?';
-    //   queryParams.push(req.user.id);
-    // }
-
-    const [requisitions] = await pool.execute(query, queryParams);
+    // Get requisition details
+    const [requisitions] = await connection.execute(
+      `SELECT r.*, 
+              u.name as user_name, u.email as user_email, u.phone as user_phone,
+              f.name as facility_name, f.location as facility_location
+       FROM requisitions r
+       LEFT JOIN users u ON r.user_id = u.id
+       LEFT JOIN facilities f ON r.facility_id = f.id
+       WHERE r.id = ?`,
+      [requisitionId]
+    );
 
     if (requisitions.length === 0) {
       return res.status(404).json({
         success: false,
-        message: 'Requisition not found or access denied'
+        message: 'Requisition not found'
       });
     }
 
-    // Get requisition items
-    const [items] = await pool.execute(
-      `SELECT ri.*, i.item_name, i.item_code, i.unit, i.quantity as available_quantity
+    const requisition = requisitions[0];
+    const facility_id = requisition.facility_id;
+
+    // Get requisition items with complete details
+    const [items] = await connection.execute(
+      `SELECT 
+          ri.id AS requisition_item_id,
+          ri.item_id, 
+          ri.quantity AS requested_quantity,
+          ri.approved_quantity,
+          ri.delivered_quantity,
+          ri.priority AS item_priority,
+          
+          -- Item details from warehouse
+          iw.item_code,
+          iw.item_name,
+          iw.category,
+          iw.description,
+          iw.unit,
+          iw.item_cost,
+          iw.expiry_date,
+          iw.quantity AS warehouse_stock,
+
+          -- Facility stock
+          IFNULL(ifac.quantity, 0) AS facility_stock,
+          
+          -- Calculate item status
+          CASE 
+            WHEN ri.approved_quantity = 0 AND ri.delivered_quantity = 0 THEN 'pending'
+            WHEN ri.approved_quantity > 0 AND ri.approved_quantity < ri.quantity THEN 'partially_approved'
+            WHEN ri.approved_quantity = ri.quantity AND ri.delivered_quantity = 0 THEN 'approved'
+            WHEN ri.delivered_quantity > 0 AND ri.delivered_quantity < ri.approved_quantity THEN 'partially_delivered'
+            WHEN ri.delivered_quantity = ri.approved_quantity THEN 'delivered'
+            ELSE 'pending'
+          END AS item_status,
+          
+          -- Stock status
+          CASE 
+            WHEN IFNULL(ifac.quantity, 0) = 0 THEN 'out_of_stock'
+            WHEN iw.expiry_date IS NOT NULL AND iw.expiry_date <= DATE_ADD(NOW(), INTERVAL 30 DAY) THEN 'near_expiry'
+            WHEN IFNULL(ifac.quantity, 0) < ri.quantity THEN 'low_stock'
+            ELSE 'in_stock'
+          END AS stock_status
        FROM requisition_items ri
-       LEFT JOIN inventory i ON ri.item_id = i.id
+       LEFT JOIN inventory_warehouse iw ON iw.id = ri.item_id
+       LEFT JOIN inventory_facility ifac ON ifac.item_id = ri.item_id AND ifac.facility_id = ?
        WHERE ri.requisition_id = ?`,
-      [id]
+      [facility_id, requisitionId]
     );
 
-    const requisition = requisitions[0];
-    requisition.items = items;
+    requisition.items = items || [];
+    requisition.total_items = items.length;
 
     res.json({
       success: true,
@@ -204,6 +244,8 @@ const getRequisitionById = async (req, res) => {
       message: 'Failed to get requisition',
       error: error.message
     });
+  } finally {
+    connection.release();
   }
 };
 
@@ -211,7 +253,7 @@ const createRequisition = async (req, res) => {
   const connection = await pool.getConnection();
 
   try {
-    const { user_id, facility_id, priority, remarks, items } = req.body;
+    const { user_id, facility_id, priority, remarks, items, estimated_usage_duration } = req.body;
 
     if (!user_id || !facility_id || !items || !Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ message: "Invalid request data" });
@@ -219,11 +261,38 @@ const createRequisition = async (req, res) => {
 
     await connection.beginTransaction();
 
+    // Check if estimated_usage_duration column exists
+    let hasEstimatedUsageColumn = false;
+    try {
+      const [columnCheck] = await connection.query(
+        `SELECT COLUMN_NAME 
+         FROM INFORMATION_SCHEMA.COLUMNS 
+         WHERE TABLE_SCHEMA = DATABASE() 
+         AND TABLE_NAME = 'requisitions' 
+         AND COLUMN_NAME = 'estimated_usage_duration'`
+      );
+      hasEstimatedUsageColumn = columnCheck.length > 0;
+    } catch (err) {
+      hasEstimatedUsageColumn = false;
+    }
+
     // Step 1: Requisition create karna
+    const insertFields = hasEstimatedUsageColumn
+      ? `(user_id, facility_id, status, priority, remarks, estimated_usage_duration, created_at)`
+      : `(user_id, facility_id, status, priority, remarks, created_at)`;
+
+    const insertValues = hasEstimatedUsageColumn
+      ? `(?, ?, 'pending', ?, ?, ?, NOW())`
+      : `(?, ?, 'pending', ?, ?, NOW())`;
+
+    const insertParams = hasEstimatedUsageColumn
+      ? [user_id, facility_id, priority, remarks, estimated_usage_duration || null]
+      : [user_id, facility_id, priority, remarks];
+
     const [requisitionResult] = await connection.execute(
-      `INSERT INTO requisitions (user_id, facility_id, status, priority, remarks, created_at) 
-       VALUES (?, ?, 'pending', ?, ?, NOW())`,
-      [user_id, facility_id, priority, remarks]
+      `INSERT INTO requisitions ${insertFields} 
+       VALUES ${insertValues}`,
+      insertParams
     );
 
     const requisition_id = requisitionResult.insertId;
@@ -274,47 +343,76 @@ const createRequisition = async (req, res) => {
 };
 // Update requisition
 const updateRequisition = async (req, res) => {
+  const connection = await pool.getConnection();
   try {
+    await connection.beginTransaction();
+    
     const { id } = req.params;
-    const { status, remarks, approved_quantity } = req.body;
+    const { status, remarks, approved_quantity, estimated_usage_duration, priority } = req.body;
 
     // Check access permissions
     let query = 'SELECT user_id, facility_id, status as current_status FROM requisitions WHERE id = ?';
     const queryParams = [id];
 
-    // if (req.user.role === 'facility_admin') {
-    //   query += ' AND facility_id = ?';
-    //   queryParams.push(req.user.facility_id);
-    // } else if (req.user.role === 'facility_user') {
-    //   query += ' AND user_id = ?';
-    //   queryParams.push(req.user.id);
-    // }
-
-    const [requisitions] = await pool.execute(query, queryParams);
+    const [requisitions] = await connection.execute(query, queryParams);
 
     if (requisitions.length === 0) {
+      await connection.rollback();
       return res.status(404).json({
         success: false,
         message: 'Requisition not found or access denied'
       });
     }
 
-    // Facility users can only update pending requisitions
-    // if (req.user.role === 'facility_user' && requisitions[0].current_status !== 'pending') {
-    //   return res.status(403).json({
-    //     success: false,
-    //     message: 'Cannot update requisition in current status'
-    //   });
-    // }
+    // Check if estimated_usage_duration column exists
+    let hasEstimatedUsageColumn = false;
+    try {
+      const [columnCheck] = await connection.query(
+        `SELECT COLUMN_NAME 
+         FROM INFORMATION_SCHEMA.COLUMNS 
+         WHERE TABLE_SCHEMA = DATABASE() 
+         AND TABLE_NAME = 'requisitions' 
+         AND COLUMN_NAME = 'estimated_usage_duration'`
+      );
+      hasEstimatedUsageColumn = columnCheck.length > 0;
+    } catch (err) {
+      hasEstimatedUsageColumn = false;
+    }
+
+    // Build update query dynamically
+    const updateFields = [];
+    const updateValues = [];
+
+    if (status !== undefined) {
+      updateFields.push('status = ?');
+      updateValues.push(status);
+    }
+    if (remarks !== undefined) {
+      updateFields.push('remarks = ?');
+      updateValues.push(remarks);
+    }
+    if (priority !== undefined) {
+      updateFields.push('priority = ?');
+      updateValues.push(priority.toLowerCase());
+    }
+    if (hasEstimatedUsageColumn && estimated_usage_duration !== undefined) {
+      updateFields.push('estimated_usage_duration = ?');
+      updateValues.push(estimated_usage_duration ? parseInt(estimated_usage_duration, 10) : null);
+    }
+    
+    updateFields.push('updated_at = NOW()');
+    updateValues.push(id);
 
     // Update requisition
-    await pool.execute(
-      'UPDATE requisitions SET status = ?, remarks = ?, updated_at = NOW() WHERE id = ?',
-      [status, remarks, id]
+    await connection.execute(
+      `UPDATE requisitions SET ${updateFields.join(', ')} WHERE id = ?`,
+      updateValues
     );
 
+    await connection.commit();
+
     // Get updated requisition
-    const [updatedRequisitions] = await pool.execute(
+    const [updatedRequisitions] = await connection.execute(
       `SELECT r.*, 
               u.name as user_name, f.name as facility_name
        FROM requisitions r
@@ -330,19 +428,22 @@ const updateRequisition = async (req, res) => {
       data: updatedRequisitions[0]
     });
   } catch (error) {
+    await connection.rollback();
     console.error('Update requisition error:', error);
     res.status(500).json({
       success: false,
       message: 'Failed to update requisition',
       error: error.message
     });
+  } finally {
+    connection.release();
   }
 };
 
 
 // const approveRequisition = async (req, res) => {
 //   const connection = await pool.getConnection();
-  
+
 //   try {
 //     await connection.beginTransaction();
 
@@ -416,112 +517,253 @@ const updateRequisition = async (req, res) => {
 // };
 
 const approveUserRequisition = async (req, res) => {
-    const connection = await pool.getConnection();
-    try {
-        const { requisition_id, approvedItems, remarks } = req.body; 
-        // approvedItems = [{ item_id: 101, approved_quantity: 10 }, ...]
+  const connection = await pool.getConnection();
+  try {
+    const { requisition_id, approvedItems, remarks } = req.body;
+    // approvedItems = [{ item_id: 101, approved_quantity: 10 }, ...]
 
-        if (!requisition_id || !approvedItems || !Array.isArray(approvedItems)) {
-            return res.status(400).json({
-                success: false,
-                message: "Requisition ID and approved items are required",
-            });
-        }
+    if (!requisition_id || !approvedItems || !Array.isArray(approvedItems)) {
+      return res.status(400).json({
+        success: false,
+        message: "Requisition ID and approved items are required",
+      });
+    }
 
-        await connection.beginTransaction();
+    await connection.beginTransaction();
 
-        // 1️⃣ Get the correct user ID from requisition
-        const [reqData] = await connection.execute(
-            `SELECT user_id FROM requisitions WHERE id = ?`,
-            [requisition_id]
-        );
+    // 1️⃣ Get the requisition details
+    const [reqData] = await connection.execute(
+      `SELECT user_id, facility_id, status FROM requisitions WHERE id = ?`,
+      [requisition_id]
+    );
 
-        if (reqData.length === 0) {
-            await connection.rollback();
-            return res.status(404).json({ success: false, message: "Requisition not found" });
-        }
+    if (reqData.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ success: false, message: "Requisition not found" });
+    }
 
-        const user_id = reqData[0].user_id;
+    const { user_id, facility_id, status: currentStatus } = reqData[0];
 
-        // 2️⃣ Update requisition status to 'approved' and save remarks
-        const [updateRequisition] = await connection.execute(
-            `UPDATE requisitions 
-             SET status = 'approved', approved_at = NOW(), remarks = ? 
+    // 2️⃣ Update approved_quantity for each item (ITEM-LEVEL APPROVAL - NO AUTO-APPROVE)
+    for (const item of approvedItems) {
+      const { item_id, approved_quantity } = item;
+
+      if (!item_id || approved_quantity <= 0) continue;
+
+      // Update only the approved_quantity for this specific item
+      await connection.execute(
+        `UPDATE requisition_items 
+                 SET approved_quantity = ? 
+                 WHERE requisition_id = ? AND item_id = ?`,
+        [approved_quantity, requisition_id, item_id]
+      );
+    }
+
+    // 3️⃣ Check all items status to determine overall requisition status
+    const [allItems] = await connection.execute(
+      `SELECT quantity, approved_quantity, delivered_quantity 
+             FROM requisition_items 
+             WHERE requisition_id = ?`,
+      [requisition_id]
+    );
+
+    let finalStatus = 'pending';
+    if (allItems.length > 0) {
+      const allApproved = allItems.every(item =>
+        item.approved_quantity > 0 && item.approved_quantity >= item.quantity
+      );
+      const allRejected = allItems.every(item => item.approved_quantity === 0);
+      const hasApproved = allItems.some(item => item.approved_quantity > 0);
+      const hasPending = allItems.some(item => item.approved_quantity === 0);
+      const hasPartiallyApproved = allItems.some(item => 
+        item.approved_quantity > 0 && item.approved_quantity < item.quantity
+      );
+
+      if (allApproved) {
+        finalStatus = 'approved';
+      } else if (allRejected) {
+        finalStatus = 'rejected';
+      } else if (hasPartiallyApproved || (hasApproved && hasPending)) {
+        finalStatus = 'partially_approved';
+      } else if (hasApproved) {
+        finalStatus = 'partially_approved'; // Some items approved but not all fully
+      } else {
+        finalStatus = currentStatus || 'pending';
+      }
+    }
+
+    // 4️⃣ Update requisition status based on item statuses
+    const [statusUpdateResult] = await connection.execute(
+      `UPDATE requisitions 
+             SET status = ?, approved_at = NOW(), updated_at = NOW(), remarks = ? 
              WHERE id = ?`,
-            [remarks || null, requisition_id]
+      [finalStatus, remarks || null, requisition_id]
+    );
+    
+    if (statusUpdateResult.affectedRows === 0) {
+      throw new Error(`Failed to update requisition status for requisition ${requisition_id}`);
+    }
+    
+    console.log(`✅ Requisition ${requisition_id} status updated to: ${finalStatus} (affected rows: ${statusUpdateResult.affectedRows})`);
+
+    // 5️⃣ Insert/Update items into inventory_user (only for approved items)
+    const inventoryUpdateResults = [];
+    for (const item of approvedItems) {
+      const { item_id, approved_quantity } = item;
+
+      if (!item_id || approved_quantity <= 0) {
+        console.log(`Skipping item ${item_id} - invalid item_id or approved_quantity`);
+        continue;
+      }
+
+      try {
+        // Get item details from requisition_items first (most reliable source)
+        const [requisitionItemData] = await connection.execute(
+          `SELECT ri.*, iw.item_code, iw.item_name, iw.category, iw.description, iw.unit, iw.item_cost, iw.expiry_date, iw.reorder_level
+           FROM requisition_items ri
+           LEFT JOIN inventory_warehouse iw ON iw.id = ri.item_id
+           WHERE ri.requisition_id = ? AND ri.item_id = ?`,
+          [requisition_id, item_id]
         );
 
-        if (updateRequisition.affectedRows === 0) {
-            await connection.rollback();
-            return res.status(404).json({ success: false, message: "Requisition not found" });
+        let itemData = null;
+        if (requisitionItemData.length > 0) {
+          itemData = requisitionItemData[0];
+        } else {
+          // Fallback: Get from facility inventory
+          const [facilityItem] = await connection.execute(
+            `SELECT * FROM inventory_facility WHERE item_id = ? AND facility_id = ?`,
+            [item_id, facility_id]
+          );
+          if (facilityItem.length > 0) {
+            itemData = facilityItem[0];
+          } else {
+            // Last fallback: Get from warehouse
+            const [warehouseItem] = await connection.execute(
+              `SELECT * FROM inventory_warehouse WHERE id = ?`,
+              [item_id]
+            );
+            if (warehouseItem.length > 0) {
+              itemData = warehouseItem[0];
+            }
+          }
         }
 
-        // 3️⃣ Insert/Update items into inventory_user
-        for (const item of approvedItems) {
-            const { item_id, approved_quantity } = item;
+        // If still no item data, use minimal data from requisition
+        if (!itemData) {
+          console.log(`Item ${item_id} not found in any inventory, using minimal data from requisition`);
+          // Get basic info from requisition_items
+          const [reqItem] = await connection.execute(
+            `SELECT * FROM requisition_items WHERE requisition_id = ? AND item_id = ?`,
+            [requisition_id, item_id]
+          );
+          if (reqItem.length > 0) {
+            itemData = {
+              item_code: reqItem[0].item_code || `ITEM-${item_id}`,
+              item_name: reqItem[0].item_name || 'Unknown Item',
+              category: reqItem[0].category || null,
+              description: reqItem[0].description || null,
+              unit: reqItem[0].unit || 'units',
+              item_cost: reqItem[0].item_cost || 0,
+              expiry_date: reqItem[0].expiry_date || null,
+              reorder_level: 10
+            };
+          } else {
+            console.error(`Cannot add item ${item_id} to user inventory - no data found`);
+            continue;
+          }
+        }
 
-            // Get item details from facility inventory
-            const [facilityItem] = await connection.execute(
-                `SELECT * FROM inventory_facility WHERE item_id = ?`,
-                [item_id]
-            );
+        // Check if item already exists in user inventory
+        const [existingUserItem] = await connection.execute(
+          `SELECT * FROM inventory_user WHERE item_id = ? AND user_id = ?`,
+          [item_id, user_id]
+        );
 
-            if (facilityItem.length === 0) continue; // skip if not found
-
-            const fi = facilityItem[0];
-
-            // Check if item already exists in user inventory
-            const [existingUserItem] = await connection.execute(
-                `SELECT * FROM inventory_user WHERE item_id = ? AND user_id = ?`,
-                [item_id, user_id]
-            );
-
-            if (existingUserItem.length > 0) {
-                // Update quantity if exists
-                await connection.execute(
-                    `UPDATE inventory_user 
+        if (existingUserItem.length > 0) {
+          // Update quantity if exists
+          const [updateResult] = await connection.execute(
+            `UPDATE inventory_user 
                      SET quantity = quantity + ?, updated_at = NOW() 
                      WHERE id = ?`,
-                    [approved_quantity, existingUserItem[0].id]
-                );
-            } else {
-                // Insert new item in inventory_user
-                await connection.execute(
-                    `INSERT INTO inventory_user 
-                    (item_code, item_name, category, description, unit, user_id, item_id, quantity, reorder_level, item_cost, expiry_date, created_at, updated_at) 
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
-                    [
-                        fi.item_code,
-                        fi.item_name,
-                        fi.category,
-                        fi.description,
-                        fi.unit,
-                        user_id,
-                        fi.item_id,
-                        approved_quantity,
-                        fi.reorder_level,
-                        fi.item_cost,
-                        fi.expiry_date
-                    ]
-                );
-            }
+            [approved_quantity, existingUserItem[0].id]
+          );
+          console.log(`✅ Updated user inventory for item ${item_id} (${itemData.item_name}), user ${user_id}, added ${approved_quantity} units. Total: ${existingUserItem[0].quantity + approved_quantity}`);
+          inventoryUpdateResults.push({ item_id, action: 'updated', quantity: approved_quantity });
+        } else {
+          // Insert new item in inventory_user
+          const [insertResult] = await connection.execute(
+            `INSERT INTO inventory_user 
+                      (item_code, item_name, category, description, unit, user_id, item_id, quantity, reorder_level, item_cost, expiry_date, created_at, updated_at) 
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
+            [
+              itemData.item_code || `ITEM-${item_id}`,
+              itemData.item_name || 'Unknown Item',
+              itemData.category || null,
+              itemData.description || null,
+              itemData.unit || 'units',
+              user_id,
+              item_id,
+              approved_quantity,
+              itemData.reorder_level || 10,
+              itemData.item_cost || 0,
+              itemData.expiry_date || null
+            ]
+          );
+          console.log(`✅ Inserted new item into user inventory: ${itemData.item_name || itemData.item_code} (ID: ${item_id}) for user ${user_id}, quantity: ${approved_quantity}`);
+          inventoryUpdateResults.push({ item_id, action: 'inserted', quantity: approved_quantity });
         }
 
-        await connection.commit();
-        res.json({
-            success: true,
-            message: "Requisition approved, remarks saved, and items added to user inventory",
-            requisition_id,
-            user_id,
-            approvedItems
-        });
-    } catch (error) {
-        await connection.rollback();
-        console.error(error);
-        res.status(500).json({ success: false, message: "Internal server error", error: error.message });
-    } finally {
-        connection.release();
+        // 6️⃣ Reduce from facility inventory (only if item exists in facility inventory and has sufficient stock)
+        const [facilityItem] = await connection.execute(
+          `SELECT * FROM inventory_facility WHERE item_id = ? AND facility_id = ?`,
+          [item_id, facility_id]
+        );
+        
+        if (facilityItem.length > 0 && parseFloat(facilityItem[0].quantity) >= approved_quantity) {
+          const [updateResult] = await connection.execute(
+            `UPDATE inventory_facility 
+                     SET quantity = quantity - ?, updated_at = NOW()
+                     WHERE item_id = ? AND facility_id = ? AND quantity >= ?`,
+            [approved_quantity, item_id, facility_id, approved_quantity]
+          );
+          if (updateResult.affectedRows > 0) {
+            console.log(`✅ Reduced facility inventory for item ${item_id} by ${approved_quantity} units`);
+          } else {
+            console.log(`⚠️ Could not reduce facility inventory for item ${item_id} - insufficient stock or update failed`);
+          }
+        } else {
+          console.log(`ℹ️ Item ${item_id} not in facility inventory or insufficient stock - skipping facility inventory reduction`);
+        }
+      } catch (itemError) {
+        console.error(`❌ Error processing item ${item_id} for user inventory:`, itemError);
+        // Continue with other items even if one fails
+        inventoryUpdateResults.push({ item_id, action: 'error', error: itemError.message });
+      }
     }
+
+    await connection.commit();
+    
+    console.log(`✅ Requisition ${requisition_id} approved successfully. Status: ${finalStatus}, Items added to user inventory: ${inventoryUpdateResults.length}`);
+    
+    res.json({
+      success: true,
+      message: `Requisition approved successfully. Status updated to "${finalStatus}". Items added to user inventory.`,
+      requisition_id,
+      user_id,
+      approvedItems,
+      finalStatus,
+      inventory_updates: inventoryUpdateResults,
+      status_updated: true,
+      user_inventory_updated: inventoryUpdateResults.length > 0
+    });
+  } catch (error) {
+    await connection.rollback();
+    console.error(error);
+    res.status(500).json({ success: false, message: "Internal server error", error: error.message });
+  } finally {
+    connection.release();
+  }
 };
 
 const bulkApproveRequisition = async (req, res) => {
@@ -1219,41 +1461,92 @@ const warehousePartialApproveRequisition = async (req, res) => {
 // Reject requisition
 
 const rejectUserRequisition = async (req, res) => {
-    const connection = await pool.getConnection();
-    try {
-        const { requisition_id, remarks } = req.body;
+  const connection = await pool.getConnection();
+  try {
+    const { requisition_id, remarks, item_ids } = req.body;
+    // item_ids: optional array - if provided, reject only those items; otherwise reject all
 
-        if (!requisition_id) {
-            return res.status(400).json({
-                success: false,
-                message: "Requisition ID is required",
-            });
-        }
-
-        await connection.beginTransaction();
-
-        // Update requisition status to 'rejected' and save remarks
-        const [updateRequisition] = await connection.execute(
-            `UPDATE requisitions 
-             SET status = 'rejected', rejected_at = NOW(), remarks = ? 
-             WHERE id = ?`,
-            [remarks || null, requisition_id]
-        );
-
-        if (updateRequisition.affectedRows === 0) {
-            await connection.rollback();
-            return res.status(404).json({ success: false, message: "Requisition not found" });
-        }
-
-        await connection.commit();
-        res.json({ success: true, message: "Requisition rejected successfully" });
-    } catch (error) {
-        await connection.rollback();
-        console.error(error);
-        res.status(500).json({ success: false, message: "Internal server error", error: error.message });
-    } finally {
-        connection.release();
+    if (!requisition_id) {
+      return res.status(400).json({
+        success: false,
+        message: "Requisition ID is required",
+      });
     }
+
+    await connection.beginTransaction();
+
+    // If item_ids provided, reject only those items (partial reject)
+    console.log("Reject Requisition - Body:", req.body);
+    console.log("Type of item_ids:", typeof item_ids, "Is Array:", Array.isArray(item_ids));
+
+    if (item_ids && Array.isArray(item_ids) && item_ids.length > 0) {
+      // Reject specific items
+      // Use query() instead of execute() for array expansion in IN (?)
+      await connection.query(
+        `UPDATE requisition_items 
+                 SET approved_quantity = 0 
+                 WHERE requisition_id = ? AND item_id IN (?)`,
+        [requisition_id, item_ids]
+      );
+
+      // Check overall status
+      const [allItems] = await connection.query(
+        `SELECT quantity, approved_quantity FROM requisition_items WHERE requisition_id = ?`,
+        [requisition_id]
+      );
+
+      const allRejected = allItems.every(item => item.approved_quantity === 0);
+      const hasApproved = allItems.some(item => item.approved_quantity > 0);
+      const hasPending = allItems.some(item => item.approved_quantity === 0);
+
+      let finalStatus = 'pending';
+      if (allRejected) {
+        finalStatus = 'rejected';
+      } else if (hasApproved && hasPending) {
+        finalStatus = 'partially_approved';
+      } else if (hasApproved && !hasPending) {
+        // Check if delivered previously? Or just assume if not rejected/pending it's approved-ish (handled by approve fn usually)
+        // If we reject some, the rest might be approved.
+        finalStatus = 'partially_approved'; // Fallback
+      }
+
+      await connection.query(
+        `UPDATE requisitions 
+                 SET status = ?, rejected_at = NOW(), remarks = ? 
+                 WHERE id = ?`,
+        [finalStatus, remarks || null, requisition_id]
+      );
+    } else {
+      // Reject all items
+      await connection.query(
+        `UPDATE requisition_items 
+                 SET approved_quantity = 0 
+                 WHERE requisition_id = ?`,
+        [requisition_id]
+      );
+
+      await connection.query(
+        `UPDATE requisitions 
+                 SET status = 'rejected', rejected_at = NOW(), remarks = ? 
+                 WHERE id = ?`,
+        [remarks || null, requisition_id]
+      );
+    }
+
+    await connection.commit();
+    res.json({
+      success: true,
+      message: item_ids && item_ids.length > 0
+        ? "Selected items rejected successfully"
+        : "Requisition rejected successfully"
+    });
+  } catch (error) {
+    await connection.rollback();
+    console.error(error);
+    res.status(500).json({ success: false, message: "Internal server error", error: error.message });
+  } finally {
+    connection.release();
+  }
 };
 
 
@@ -1525,16 +1818,32 @@ const getRequisitionsByUser = async (req, res) => {
       });
     }
 
-    // 🔹 Step 1: Fetch requisitions for the user
-    const [requisitions] = await connection.query(
-      `SELECT 
-          r.id AS requisition_id,
+    // 🔹 Step 1: Check if estimated_usage_duration column exists
+    let hasEstimatedUsageColumn = false;
+    try {
+      const [columnCheck] = await connection.query(
+        `SELECT COLUMN_NAME 
+         FROM INFORMATION_SCHEMA.COLUMNS 
+         WHERE TABLE_SCHEMA = DATABASE() 
+         AND TABLE_NAME = 'requisitions' 
+         AND COLUMN_NAME = 'estimated_usage_duration'`
+      );
+      hasEstimatedUsageColumn = columnCheck.length > 0;
+    } catch (err) {
+      // If check fails, assume column doesn't exist
+      hasEstimatedUsageColumn = false;
+    }
+
+    // 🔹 Step 2: Fetch requisitions for the user
+    const selectFields = hasEstimatedUsageColumn
+      ? `r.id AS requisition_id,
           r.user_id,
           r.facility_id,
           r.warehouse_id,
           r.status,
           r.priority,
           r.remarks,
+          r.estimated_usage_duration,
           r.approved_by,
           r.approved_at,
           r.delivered_by,
@@ -1542,7 +1851,26 @@ const getRequisitionsByUser = async (req, res) => {
           r.created_at,
           r.updated_at,
           r.rejected_by,
-          r.rejected_at
+          r.rejected_at`
+      : `r.id AS requisition_id,
+          r.user_id,
+          r.facility_id,
+          r.warehouse_id,
+          r.status,
+          r.priority,
+          r.remarks,
+          NULL as estimated_usage_duration,
+          r.approved_by,
+          r.approved_at,
+          r.delivered_by,
+          r.delivered_at,
+          r.created_at,
+          r.updated_at,
+          r.rejected_by,
+          r.rejected_at`;
+
+    const [requisitions] = await connection.query(
+      `SELECT ${selectFields}
        FROM requisitions r
        WHERE r.user_id = ? 
        ORDER BY r.created_at DESC`,
@@ -1558,8 +1886,10 @@ const getRequisitionsByUser = async (req, res) => {
       });
     }
 
-    // 🔹 Step 3: Fetch all requisition items
+    // 🔹 Step 3: Fetch all requisition items with item details
     const requisitionIds = requisitions.map(r => r.requisition_id);
+    
+    // Fetch items with item details from inventory_warehouse and inventory tables
     const [items] = await connection.query(
       `SELECT 
           ri.id AS requisition_item_id,
@@ -1569,8 +1899,16 @@ const getRequisitionsByUser = async (req, res) => {
           ri.approved_quantity,
           ri.delivered_quantity,
           ri.priority,
-          ri.created_at
+          ri.created_at,
+          COALESCE(iw.item_name, i.item_name, 'Unknown Item') AS item_name,
+          COALESCE(iw.item_code, i.item_code, 'N/A') AS item_code,
+          COALESCE(iw.category, i.category, 'N/A') AS category,
+          COALESCE(iw.unit, i.unit, 'units') AS unit,
+          COALESCE(iw.description, i.description, '') AS description,
+          COALESCE(iw.quantity, i.quantity, 0) AS available_quantity
        FROM requisition_items ri
+       LEFT JOIN inventory_warehouse iw ON ri.item_id = iw.id
+       LEFT JOIN inventory i ON ri.item_id = i.id
        WHERE ri.requisition_id IN (?)`,
       [requisitionIds]
     );
@@ -1615,15 +1953,29 @@ const getRequisitionsByFacility = async (req, res) => {
     }
 
     // 🔹 Step 1: Get all requisitions for this facility
-    const [requisitions] = await connection.query(
-      `
-      SELECT 
-        r.id,
+    // Check if estimated_usage_duration column exists
+    let hasEstimatedUsageColumn = false;
+    try {
+      const [columnCheck] = await connection.query(
+        `SELECT COLUMN_NAME 
+         FROM INFORMATION_SCHEMA.COLUMNS 
+         WHERE TABLE_SCHEMA = DATABASE() 
+         AND TABLE_NAME = 'requisitions' 
+         AND COLUMN_NAME = 'estimated_usage_duration'`
+      );
+      hasEstimatedUsageColumn = columnCheck.length > 0;
+    } catch (err) {
+      hasEstimatedUsageColumn = false;
+    }
+
+    const selectFields = hasEstimatedUsageColumn
+      ? `r.id,
         r.user_id,
         r.facility_id,
         r.status,
         r.priority,
         r.remarks,
+        r.estimated_usage_duration,
         r.approved_by,
         r.approved_at,
         r.delivered_by,
@@ -1636,7 +1988,32 @@ const getRequisitionsByFacility = async (req, res) => {
         u.email AS user_email,
         u.phone AS user_phone,
         f.name AS facility_name,
-        f.location AS facility_location
+        f.location AS facility_location`
+      : `r.id,
+        r.user_id,
+        r.facility_id,
+        r.status,
+        r.priority,
+        r.remarks,
+        NULL AS estimated_usage_duration,
+        r.approved_by,
+        r.approved_at,
+        r.delivered_by,
+        r.delivered_at,
+        r.created_at,
+        r.updated_at,
+        r.rejected_by,
+        r.rejected_at,
+        u.name AS user_name,
+        u.email AS user_email,
+        u.phone AS user_phone,
+        f.name AS facility_name,
+        f.location AS facility_location`;
+
+    const [requisitions] = await connection.query(
+      `
+      SELECT 
+        ${selectFields}
       FROM requisitions r
       LEFT JOIN users u ON r.user_id = u.id
       LEFT JOIN facilities f ON r.facility_id = f.id
@@ -1673,9 +2050,32 @@ const getRequisitionsByFacility = async (req, res) => {
           iw.unit,
           iw.item_cost,
           iw.expiry_date,
+          iw.quantity AS warehouse_stock,
 
-          -- Facility stock
-          IFNULL(ifac.quantity, 0) AS facility_stock
+          -- Facility stock (check inventory_facility first, if not found check if item exists in facility inventory by item_code)
+          COALESCE(
+            ifac.quantity,
+            (SELECT quantity FROM inventory_facility WHERE item_code = iw.item_code AND facility_id = ? LIMIT 1),
+            0
+          ) AS facility_stock,
+          
+          -- Calculate item status
+          CASE 
+            WHEN ri.approved_quantity = 0 AND ri.delivered_quantity = 0 THEN 'pending'
+            WHEN ri.approved_quantity > 0 AND ri.approved_quantity < ri.quantity THEN 'partially_approved'
+            WHEN ri.approved_quantity = ri.quantity AND ri.delivered_quantity = 0 THEN 'approved'
+            WHEN ri.delivered_quantity > 0 AND ri.delivered_quantity < ri.approved_quantity THEN 'partially_delivered'
+            WHEN ri.delivered_quantity = ri.approved_quantity THEN 'delivered'
+            ELSE 'pending'
+          END AS item_status,
+          
+          -- Stock status calculation
+          CASE 
+            WHEN COALESCE(ifac.quantity, (SELECT quantity FROM inventory_facility WHERE item_code = iw.item_code AND facility_id = ? LIMIT 1), 0) = 0 THEN 'out_of_stock'
+            WHEN iw.expiry_date IS NOT NULL AND iw.expiry_date <= DATE_ADD(NOW(), INTERVAL 30 DAY) THEN 'near_expiry'
+            WHEN COALESCE(ifac.quantity, (SELECT quantity FROM inventory_facility WHERE item_code = iw.item_code AND facility_id = ? LIMIT 1), 0) < ri.quantity THEN 'low_stock'
+            ELSE 'in_stock'
+          END AS stock_status
         FROM requisition_items ri
         LEFT JOIN inventory_warehouse iw 
           ON iw.id = ri.item_id
@@ -1683,10 +2083,37 @@ const getRequisitionsByFacility = async (req, res) => {
           ON ifac.item_id = ri.item_id AND ifac.facility_id = ?
         WHERE ri.requisition_id = ?
         `,
-        [facility_id, requisition.id]
+        [facility_id, facility_id, facility_id, facility_id, requisition.id]
       );
 
       requisition.items = items.length ? items : [];
+
+      // Calculate overall request status based on item statuses
+      if (requisition.items.length > 0) {
+        const itemStatuses = requisition.items.map(item => item.item_status);
+        const allPending = itemStatuses.every(s => s === 'pending');
+        const allApproved = itemStatuses.every(s => s === 'approved' || s === 'delivered');
+        const allRejected = itemStatuses.every(s => s === 'rejected');
+        const hasApproved = itemStatuses.some(s => s === 'approved' || s === 'partially_approved' || s === 'delivered');
+        const hasPending = itemStatuses.some(s => s === 'pending');
+
+        if (allRejected) {
+          requisition.calculated_status = 'rejected';
+        } else if (allApproved) {
+          requisition.calculated_status = 'approved';
+        } else if (hasApproved && hasPending) {
+          requisition.calculated_status = 'partially_approved';
+        } else if (allPending) {
+          requisition.calculated_status = 'pending';
+        } else {
+          requisition.calculated_status = requisition.status || 'pending';
+        }
+      } else {
+        requisition.calculated_status = requisition.status || 'pending';
+      }
+
+      // Add total items count
+      requisition.total_items = requisition.items.length;
     }
 
     // 🔹 Step 3: Send response
@@ -1722,9 +2149,12 @@ const raiseToWarehouse = async (req, res) => {
       });
     }
 
-    // 🔹 Check if requisition exists
+    // 🔹 Check if requisition exists and get user name
     const [requisition] = await connection.query(
-      "SELECT id, status FROM requisitions WHERE id = ?",
+      `SELECT r.id, r.status, u.name AS user_name 
+       FROM requisitions r 
+       LEFT JOIN users u ON r.user_id = u.id 
+       WHERE r.id = ?`,
       [requisition_id]
     );
 
@@ -1735,6 +2165,19 @@ const raiseToWarehouse = async (req, res) => {
       });
     }
 
+    const user_name = requisition[0].user_name || null;
+
+    // 🔹 Normalize priority to match enum values: 'Normal', 'High', 'Urgent'
+    const normalizePriority = (pri) => {
+      if (!pri) return 'Normal';
+      const p = String(pri).toLowerCase().trim();
+      if (p === 'high' || p === 'critical') return 'High';
+      if (p === 'urgent') return 'Urgent';
+      return 'Normal'; // Default for 'low', 'medium', or any other value
+    };
+
+    const normalizedPriority = normalizePriority(priority);
+
     // 🔹 Insert into raise_requests
     for (const item of items) {
       const { item_id, required_quantity } = item;
@@ -1743,9 +2186,9 @@ const raiseToWarehouse = async (req, res) => {
 
       await connection.query(
         `INSERT INTO raise_requests 
-          (requisition_id, facility_id, item_id, required_qty, priority, remarks, status, created_at, updated_at, raised_by)
+          (requisition_id, facility_id, item_id, required_qty, priority, remarks, status, created_at, updated_at, user_name)
          VALUES (?, ?, ?, ?, ?, ?, 'pending', NOW(), NOW(), ?)`,
-        [requisition_id, facility_id, item_id, required_quantity, priority || "Normal", remarks || null, user_id]
+        [requisition_id, facility_id, item_id, required_quantity, normalizedPriority, remarks || null, user_name]
       );
     }
 
@@ -1782,8 +2225,8 @@ const getRaiseRequests = async (req, res) => {
     const query = `
       SELECT 
         rr.id AS raise_request_id,
-        rr.raised_by AS user_id,
-        u.name AS user_name,
+        rr.user_name,
+        r.user_id,
         rr.requisition_id,
         rr.facility_id,
         f.name AS facility_name,
@@ -1807,7 +2250,7 @@ const getRaiseRequests = async (req, res) => {
         ) AS items
       FROM raise_requests rr
       LEFT JOIN facilities f ON rr.facility_id = f.id
-      LEFT JOIN users u ON rr.raised_by = u.id
+      LEFT JOIN requisitions r ON rr.requisition_id = r.id
       LEFT JOIN requisition_items ri ON rr.requisition_id = ri.requisition_id AND rr.item_id = ri.item_id
       LEFT JOIN inventory i ON rr.item_id = i.id
       GROUP BY rr.id
@@ -1835,12 +2278,135 @@ const getRaiseRequests = async (req, res) => {
 
 
 
+// Approve All Items in a Requisition
+const approveAllItems = async (req, res) => {
+  const connection = await pool.getConnection();
+  try {
+    const { requisition_id, remarks } = req.body;
+
+    if (!requisition_id) {
+      return res.status(400).json({
+        success: false,
+        message: "Requisition ID is required",
+      });
+    }
+
+    await connection.beginTransaction();
+
+    // Get requisition details
+    const [reqData] = await connection.execute(
+      `SELECT user_id, facility_id FROM requisitions WHERE id = ?`,
+      [requisition_id]
+    );
+
+    if (reqData.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ success: false, message: "Requisition not found" });
+    }
+
+    const { user_id, facility_id } = reqData[0];
+
+    // Get all items for this requisition
+    const [items] = await connection.execute(
+      `SELECT item_id, quantity FROM requisition_items WHERE requisition_id = ?`,
+      [requisition_id]
+    );
+
+    if (items.length === 0) {
+      await connection.rollback();
+      return res.status(400).json({ success: false, message: "No items found in requisition" });
+    }
+
+    // Approve all items (set approved_quantity = quantity for each)
+    for (const item of items) {
+      await connection.execute(
+        `UPDATE requisition_items 
+         SET approved_quantity = ? 
+         WHERE requisition_id = ? AND item_id = ?`,
+        [item.quantity, requisition_id, item.item_id]
+      );
+
+      // Add to user inventory
+      const [facilityItem] = await connection.execute(
+        `SELECT * FROM inventory_facility WHERE item_id = ? AND facility_id = ?`,
+        [item.item_id, facility_id]
+      );
+
+      if (facilityItem.length > 0) {
+        const fi = facilityItem[0];
+        const [existingUserItem] = await connection.execute(
+          `SELECT * FROM inventory_user WHERE item_id = ? AND user_id = ?`,
+          [item.item_id, user_id]
+        );
+
+        if (existingUserItem.length > 0) {
+          await connection.execute(
+            `UPDATE inventory_user 
+             SET quantity = quantity + ?, updated_at = NOW() 
+             WHERE id = ?`,
+            [item.quantity, existingUserItem[0].id]
+          );
+        } else {
+          await connection.execute(
+            `INSERT INTO inventory_user 
+            (item_code, item_name, category, description, unit, user_id, item_id, quantity, reorder_level, item_cost, expiry_date, created_at, updated_at) 
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
+            [
+              fi.item_code,
+              fi.item_name,
+              fi.category,
+              fi.description,
+              fi.unit,
+              user_id,
+              fi.item_id,
+              item.quantity,
+              fi.reorder_level,
+              fi.item_cost,
+              fi.expiry_date
+            ]
+          );
+        }
+
+        // Reduce from facility inventory
+        await connection.execute(
+          `UPDATE inventory_facility 
+           SET quantity = quantity - ? 
+           WHERE item_id = ? AND facility_id = ? AND quantity >= ?`,
+          [item.quantity, item.item_id, facility_id, item.quantity]
+        );
+      }
+    }
+
+    // Update requisition status to 'approved'
+    await connection.execute(
+      `UPDATE requisitions 
+       SET status = 'approved', approved_at = NOW(), remarks = ? 
+       WHERE id = ?`,
+      [remarks || null, requisition_id]
+    );
+
+    await connection.commit();
+    res.json({
+      success: true,
+      message: "All items approved successfully",
+      requisition_id
+    });
+  } catch (error) {
+    await connection.rollback();
+    console.error(error);
+    res.status(500).json({ success: false, message: "Internal server error", error: error.message });
+  } finally {
+    connection.release();
+  }
+};
+
 module.exports = {
   getRequisitions,
   getRequisitionById,
   createRequisition,
   updateRequisition,
   approveUserRequisition,
+  approveAllItems,
   deliverRequisition,
   deleteRequisition,
   getRequisitionsByUser,

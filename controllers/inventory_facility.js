@@ -16,7 +16,7 @@ const getInventoryByFacilityId = async (req, res) => {
     }
 
     const [rows] = await connection.execute(
-      `SELECT id, item_code, item_name, category, description, unit, facility_id, item_id, quantity, reorder_level, item_cost, expiry_date, created_at, updated_at
+      `SELECT id, item_code, item_name, category, description, unit, facility_id, item_id, quantity, reorder_level, item_cost, expiry_date, COALESCE(batch_number, 'N/A') as batch_number, created_at, updated_at
        FROM inventory_facility
        WHERE facility_id = ?`,
       [facility_id]
@@ -58,6 +58,7 @@ const getAllInventory = async (req, res) => {
         inv.reorder_level,
         inv.item_cost,
         inv.expiry_date,
+        COALESCE(inv.batch_number, 'N/A') as batch_number,
         inv.created_at,
         inv.updated_at
       FROM inventory_facility inv
@@ -86,6 +87,7 @@ const getAllInventory = async (req, res) => {
 
 
 
-module.exports = { getInventoryByFacilityId,
+module.exports = {
+  getInventoryByFacilityId,
   getAllInventory
- };
+};

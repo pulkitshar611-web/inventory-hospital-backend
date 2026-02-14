@@ -61,32 +61,40 @@ const {
   updateRequisition,
   deleteRequisition,
   approveUserRequisition,
+  approveAllItems,
   deliverRequisition,
   getRequisitionsByUser,
   rejectUserRequisition,
   getRequisitionsByFacility,
   partialApproveRequisition,
   bulkApproveRequisition,
+  raiseToWarehouse,
+  getRaiseRequests
 } = require('../controllers/requisitionController.js');
 
 const router = express.Router();
+// Specific routes first (before generic :id route)
 router.get('/', getRequisitions);
-// Get requisition by ID
-router.get('/:id', getRequisitionById);
 router.get('/facility/:facility_id', getRequisitionsByFacility);
 router.get('/user/:user_id', getRequisitionsByUser);
+router.get('/raise/all', getRaiseRequests);
+// Generic routes
+router.get('/:id', getRequisitionById);
 // Create requisition
 router.post('/', validate(requisitionSchemas.create), createRequisition);
 // Update requisition
 router.put('/:id', validate(requisitionSchemas.update), updateRequisition);
 // Approve requisition
 router.post('/approve', approveUserRequisition);
+router.post('/approve-all', approveAllItems);
 router.post('/bulk-approve', bulkApproveRequisition);
 router.patch('/:id/partial-approve', partialApproveRequisition);
 // Deliver requisition
 router.patch('/:id/deliver', deliverRequisition);
 // Reject requisition
-router.post('/reject',rejectUserRequisition);// ✅ correct route
+router.post('/reject', rejectUserRequisition);// ✅ correct route
+// Raise Request to Warehouse
+router.post('/raise', raiseToWarehouse);
 // Delete requisition
 router.delete('/:requisition_id', deleteRequisition);
 

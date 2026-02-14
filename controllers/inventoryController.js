@@ -17,6 +17,7 @@ const getInventory = async (req, res) => {
         reorder_level,
         item_cost,
         expiry_date,
+        COALESCE(batch_number, 'N/A') as batch_number,
         created_at,
         updated_at
       FROM inventory_warehouse
@@ -32,6 +33,54 @@ const getInventory = async (req, res) => {
     });
   } catch (error) {
     console.error("Error fetching all inventory:", error);
+    res.status(500).json({
+      success: false,
+      message: "Internal server error.",
+      error: error.message
+    });
+  }
+};
+
+// Get warehouse inventory item by ID
+const getWarehouseInventoryById = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const query = `
+      SELECT 
+        id,
+        item_code,
+        item_name,
+        category,
+        description,
+        unit,
+        quantity,
+        reorder_level,
+        item_cost,
+        expiry_date,
+        COALESCE(batch_number, 'N/A') as batch_number,
+        created_at,
+        updated_at
+      FROM inventory_warehouse
+      WHERE id = ?
+    `;
+
+    const [rows] = await pool.query(query, [id]);
+
+    if (rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Item not found."
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      message: "Item details fetched successfully.",
+      data: rows[0]
+    });
+  } catch (error) {
+    console.error("Error fetching inventory item:", error);
     res.status(500).json({
       success: false,
       message: "Internal server error.",
@@ -97,52 +146,48 @@ const getInventoryByFacilityId = async (req, res) => {
 
     const [items] = await pool.execute(`
       SELECT 
+        ifac.id AS id,
         ifac.id AS facility_inventory_id,
         ifac.facility_id,
-        ifac.inventory_id AS item_id,
-        ifac.quantity AS facility_quantity,
-
-        -- requisition_items table fields
-        ri.id AS requisition_item_id,
-        ri.requisition_id,
-        ri.quantity AS requisition_quantity,
-        ri.approved_quantity,
-        ri.delivered_quantity,
-        ri.priority,
-        ri.created_at AS requisition_created_at,
-
-        -- inventory table fields
-        i.item_name,
-        i.item_code,
-        i.category,
-        i.unit,
-        i.reorder_level,
+        ifac.item_id,
+        ifac.quantity,
+        COALESCE(ifac.batch_number, 'N/A') as batch_number,
+        ifac.item_cost,
+        ifac.expiry_date,
+        -- Use COALESCE to prioritize inventory_facility fields, fallback to inventory table
+        COALESCE(ifac.item_code, i.item_code) AS item_code,
+        COALESCE(ifac.item_name, i.item_name) AS item_name,
+        COALESCE(ifac.category, i.category) AS category,
+        COALESCE(ifac.unit, i.unit) AS unit,
+        COALESCE(ifac.reorder_level, i.reorder_level, 0) AS reorder_level,
+        COALESCE(ifac.description, i.description, '') AS description,
+        ifac.supplier_id,
+        ifac.procurement_date,
+        ifac.created_at,
+        ifac.created_at AS added_at,
 
         -- facility table fields
         f.name AS facility_name,
         f.location AS facility_location,
-        u.name AS facility_admin_user_name,  -- ✅ replaced admin_user_id with user name
+        u.name AS facility_admin_user_name,
 
-        -- requisition table fields
-        r.status AS requisition_status,
-        r.created_at AS requisition_date,
+        -- supplier table fields
+        s.name AS supplier_name,
 
-        CASE WHEN ifac.quantity <= i.reorder_level THEN 1 ELSE 0 END AS is_low_stock
+        CASE WHEN ifac.quantity <= COALESCE(ifac.reorder_level, i.reorder_level, 0) THEN 1 ELSE 0 END AS is_low_stock
 
       FROM inventory_facility ifac
       LEFT JOIN inventory i 
-        ON ifac.inventory_id = i.id
+        ON ifac.item_id = i.id
       LEFT JOIN facilities f 
         ON ifac.facility_id = f.id
       LEFT JOIN users u 
-        ON f.admin_user_id = u.id   -- ✅ Join with users to get user name
-      LEFT JOIN requisition_items ri 
-        ON ri.item_id = ifac.inventory_id
-      LEFT JOIN requisitions r 
-        ON r.id = ri.requisition_id 
-        AND r.facility_id = ifac.facility_id
+        ON f.admin_user_id = u.id
+      LEFT JOIN suppliers s
+        ON ifac.supplier_id = s.id
       WHERE ifac.facility_id = ?
-      ORDER BY ifac.updated_at DESC, ri.created_at DESC
+      GROUP BY ifac.id
+      ORDER BY ifac.updated_at DESC, ifac.created_at DESC
     `, [id]);
 
     if (items.length === 0) {
@@ -180,6 +225,8 @@ const getInventoryByUserId = async (req, res) => {
       });
     }
 
+    console.log(`Fetching inventory for user_id: ${user_id}`);
+
     const [rows] = await connection.query(
       `SELECT 
           id,
@@ -208,9 +255,17 @@ const getInventoryByUserId = async (req, res) => {
       });
     }
 
+    // Add batch_number as 'N/A' since inventory_user table doesn't have this column
+    // If you want to add batch_number to inventory_user table, run:
+    // ALTER TABLE inventory_user ADD COLUMN batch_number VARCHAR(100) DEFAULT NULL AFTER expiry_date;
+    const rowsWithBatchNumber = rows.map(row => ({
+      ...row,
+      batch_number: 'N/A'
+    }));
+
     res.status(200).json({
       success: true,
-      data: rows,
+      data: rowsWithBatchNumber,
     });
   } catch (error) {
     console.error("Error fetching inventory by user_id:", error);
@@ -237,7 +292,8 @@ const createWarehouseInventory = async (req, res) => {
       quantity,
       reorder_level,
       item_cost,
-      expiry_date
+      expiry_date,
+      batch_number
     } = req.body;
 
     if (
@@ -257,8 +313,8 @@ const createWarehouseInventory = async (req, res) => {
 
     const [result] = await pool.query(
       `INSERT INTO inventory_warehouse 
-      (item_code, item_name, category, description, unit, quantity, reorder_level, item_cost, expiry_date, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
+      (item_code, item_name, category, description, unit, quantity, reorder_level, item_cost, expiry_date, batch_number, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
       [
         item_code,
         item_name,
@@ -268,7 +324,8 @@ const createWarehouseInventory = async (req, res) => {
         quantity,
         reorder_level,
         item_cost,
-        expiry_date || null
+        expiry_date || null,
+        batch_number || null
       ]
     );
 
@@ -294,7 +351,7 @@ const createWarehouseInventoryBulk = async (req, res) => {
   try {
     let itemsData = req.body;
 
-    // Agar single object bheja gaya ho to usse array me convert kar do
+    // Convert single object to array if needed
     if (!Array.isArray(itemsData)) itemsData = [itemsData];
 
     if (itemsData.length === 0) {
@@ -318,50 +375,37 @@ const createWarehouseInventoryBulk = async (req, res) => {
 
     await connection.beginTransaction();
 
-    const insertedIds = [];
+    // Prepare data for bulk insert
+    const values = itemsData.map(item => [
+      item.item_code,
+      item.item_name,
+      item.category,
+      item.description || null,
+      item.unit,
+      item.quantity,
+      item.reorder_level,
+      item.item_cost,
+      item.expiry_date || null,
+      item.batch_number || null,
+      new Date(), // created_at
+      new Date()  // updated_at
+    ]);
 
-    for (const item of itemsData) {
-      const {
-        item_code,
-        item_name,
-        category,
-        description,
-        unit,
-        quantity,
-        reorder_level,
-        item_cost,
-        expiry_date
-      } = item;
+    const query = `INSERT INTO inventory_warehouse 
+      (item_code, item_name, category, description, unit, quantity, reorder_level, item_cost, expiry_date, batch_number, created_at, updated_at) 
+      VALUES ?`;
 
-      const [result] = await connection.query(
-        `INSERT INTO inventory_warehouse 
-        (item_code, item_name, category, description, unit, quantity, reorder_level, item_cost, expiry_date, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
-        [
-          item_code,
-          item_name,
-          category,
-          description || null,
-          unit,
-          quantity,
-          reorder_level,
-          item_cost,
-          expiry_date || null
-        ]
-      );
-
-      insertedIds.push(result.insertId);
-    }
+    const [result] = await connection.query(query, [values]);
 
     await connection.commit();
 
     res.status(201).json({
       success: true,
-      message: `${insertedIds.length} warehouse inventory items created successfully.`,
-      ids: insertedIds
+      message: `${result.affectedRows} warehouse inventory items created successfully.`,
+      ids: [] // Bulk insert doesn't easily return all IDs in MySQL, simply returning success count
     });
   } catch (error) {
-    await connection.rollback();
+    if (connection) await connection.rollback();
     console.error("Error creating warehouse inventory bulk:", error);
     res.status(500).json({
       success: false,
@@ -369,7 +413,7 @@ const createWarehouseInventoryBulk = async (req, res) => {
       error: error.message
     });
   } finally {
-    connection.release();
+    if (connection) connection.release();
   }
 };
 
@@ -400,15 +444,15 @@ const createInventoryFacility = async (req, res) => {
 
     // 🔁 Loop over each item user sent
     for (const item of itemsData) {
-      const { 
-        item_code, 
+      const {
+        item_code,
         item_cost,
-        expiry_date, 
-        item_name, 
-        category, 
-        description, 
-        unit, 
-        quantity, 
+        expiry_date,
+        item_name,
+        category,
+        description,
+        unit,
+        quantity,
         reorder_level = 0
       } = item;
 
@@ -433,15 +477,15 @@ const createInventoryFacility = async (req, res) => {
             (item_code, item_cost, expiry_date, item_name, category, description, unit, quantity, reorder_level, facility_id, created_at) 
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())`,
           [
-            item_code, 
-            item_cost, 
-            expiry_date || null, 
-            item_name, 
-            category || null, 
-            description || null, 
-            unit, 
-            quantity || 0, 
-            reorder_level, 
+            item_code,
+            item_cost,
+            expiry_date || null,
+            item_name,
+            category || null,
+            description || null,
+            unit,
+            quantity || 0,
+            reorder_level,
             facility_id
           ]
         );
@@ -496,7 +540,8 @@ const updateInventoryItem = async (req, res) => {
       quantity,
       reorder_level,
       item_cost,
-      expiry_date
+      expiry_date,
+      batch_number
     } = req.body;
 
     // ✅ Validate ID
@@ -559,6 +604,10 @@ const updateInventoryItem = async (req, res) => {
     if (expiry_date !== undefined) {
       updateFields.push("expiry_date = ?");
       values.push(expiry_date);
+    }
+    if (batch_number !== undefined) {
+      updateFields.push("batch_number = ?");
+      values.push(batch_number);
     }
 
     // Always update updated_at
@@ -630,7 +679,7 @@ const updateStock = async (req, res) => {
     let newQuantity;
 
     switch (type) {
-      case 'add': 
+      case 'add':
         newQuantity = currentQuantity + quantity;
         break;
       case 'subtract':
@@ -826,8 +875,347 @@ const getCategories = async (req, res) => {
 };
 
 
+// Date validation and conversion helper
+const validateAndConvertDate = (dateStr) => {
+  if (!dateStr || dateStr.toString().trim() === '' || dateStr.toString().toLowerCase() === 'n/a' || dateStr.toString().toLowerCase() === 'na') {
+    return null;
+  }
+
+  // Remove quotes and trim
+  dateStr = dateStr.toString().replace(/['"]/g, '').trim();
+
+  // Already in YYYY-MM-DD format
+  if (/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
+    // Validate the date
+    const date = new Date(dateStr);
+    if (isNaN(date.getTime())) {
+      return null;
+    }
+    return dateStr;
+  }
+
+  // Handle MM/DD/YYYY format (e.g., 12/26/2025)
+  if (/^\d{1,2}\/\d{1,2}\/\d{4}$/.test(dateStr)) {
+    const parts = dateStr.split('/');
+    const month = parts[0].padStart(2, '0');
+    const day = parts[1].padStart(2, '0');
+    const year = parts[2];
+    const convertedDate = `${year}-${month}-${day}`;
+
+    // Validate
+    const date = new Date(convertedDate);
+    if (isNaN(date.getTime())) {
+      return null;
+    }
+    return convertedDate;
+  }
+
+  // Try to parse as Date object
+  try {
+    const date = new Date(dateStr);
+    if (!isNaN(date.getTime())) {
+      const year = date.getFullYear();
+      const month = String(date.getMonth() + 1).padStart(2, '0');
+      const day = String(date.getDate()).padStart(2, '0');
+      return `${year}-${month}-${day}`;
+    }
+  } catch (e) {
+    // Invalid date
+  }
+
+  return null;
+};
+
+// CSV/Excel Bulk Import
+const bulkImportInventory = async (req, res) => {
+  const connection = await pool.getConnection();
+  await connection.beginTransaction();
+
+  try {
+    const { items } = req.body; // Array of items from CSV/Excel
+
+    if (!items || !Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Items array is required"
+      });
+    }
+
+    const results = {
+      success: [],
+      failed: []
+    };
+
+    for (const item of items) {
+      try {
+        const {
+          item_code,
+          item_name,
+          category,
+          description,
+          unit,
+          quantity,
+          reorder_level,
+          item_cost,
+          expiry_date,
+          batch_number,
+          supplier_id
+        } = item;
+
+        if (!item_name || !category) {
+          results.failed.push({
+            item: item_name || 'Unknown',
+            error: 'Missing required fields: item_name and category'
+          });
+          continue;
+        }
+
+        // Validate and convert date
+        const validExpiryDate = validateAndConvertDate(expiry_date);
+        if (expiry_date && expiry_date.toString().trim() !== '' && expiry_date.toString().toLowerCase() !== 'n/a' && !validExpiryDate) {
+          results.failed.push({
+            item: item_name,
+            error: `Invalid date format for expiry_date: "${expiry_date}". Use YYYY-MM-DD format (e.g., 2025-12-31) or MM/DD/YYYY format (e.g., 12/31/2025)`
+          });
+          continue;
+        }
+
+        // Check if item exists
+        const [existing] = await connection.execute(
+          `SELECT id FROM inventory_warehouse WHERE item_code = ? OR (item_name = ? AND category = ?)`,
+          [item_code || null, item_name, category]
+        );
+
+        if (existing.length > 0) {
+          // Update existing
+          await connection.execute(
+            `UPDATE inventory_warehouse SET
+             quantity = quantity + ?,
+             item_cost = ?,
+             expiry_date = ?,
+             batch_number = ?,
+             supplier_id = ?,
+             updated_at = NOW()
+             WHERE id = ?`,
+            [
+              parseFloat(quantity) || 0,
+              item_cost || null,
+              validExpiryDate,
+              batch_number || null,
+              supplier_id || null,
+              existing[0].id
+            ]
+          );
+          results.success.push({ item: item_name, action: 'updated' });
+        } else {
+          // Insert new
+          const [result] = await connection.execute(
+            `INSERT INTO inventory_warehouse 
+             (item_code, item_name, category, description, unit, quantity, reorder_level, item_cost, expiry_date, batch_number, supplier_id, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
+            [
+              item_code || null,
+              item_name,
+              category,
+              description || null,
+              unit || 'units',
+              parseFloat(quantity) || 0,
+              parseInt(reorder_level) || 0,
+              item_cost || null,
+              validExpiryDate,
+              batch_number || null,
+              supplier_id || null
+            ]
+          );
+          results.success.push({ item: item_name, action: 'created', id: result.insertId });
+        }
+      } catch (error) {
+        results.failed.push({
+          item: item.item_name || 'Unknown',
+          error: error.message
+        });
+      }
+    }
+
+    await connection.commit();
+
+    res.status(200).json({
+      success: true,
+      message: `Bulk import completed. ${results.success.length} succeeded, ${results.failed.length} failed.`,
+      data: results
+    });
+  } catch (error) {
+    await connection.rollback();
+    console.error("Error in bulk import:", error);
+    res.status(500).json({
+      success: false,
+      message: "Error in bulk import",
+      error: error.message
+    });
+  } finally {
+    connection.release();
+  }
+};
+
+// Manual Entry for External Procurement
+const manualEntryInventory = async (req, res) => {
+  const connection = await pool.getConnection();
+  await connection.beginTransaction();
+
+  try {
+    const {
+      facility_id,
+      item_code,
+      item_name,
+      category,
+      description,
+      unit,
+      quantity,
+      reorder_level,
+      item_cost,
+      expiry_date,
+      batch_number,
+      supplier_id,
+      procurement_date
+    } = req.body;
+
+    if (!facility_id || !item_name || !category) {
+      return res.status(400).json({
+        success: false,
+        message: "facility_id, item_name, and category are required"
+      });
+    }
+
+    // Check if item exists in facility inventory
+    const [existing] = await connection.execute(
+      `SELECT id, quantity FROM inventory_facility 
+       WHERE facility_id = ? AND item_name = ? AND category = ?`,
+      [facility_id, item_name, category]
+    );
+
+    if (existing.length > 0) {
+      // Update existing
+      await connection.execute(
+        `UPDATE inventory_facility SET
+         quantity = quantity + ?,
+         item_cost = ?,
+         expiry_date = ?,
+         batch_number = ?,
+         supplier_id = ?,
+         procurement_date = ?,
+         source_type = 'external',
+         updated_at = NOW()
+         WHERE id = ?`,
+        [
+          parseFloat(quantity) || 0,
+          item_cost || null,
+          expiry_date || null,
+          batch_number || null,
+          supplier_id || null,
+          procurement_date || null,
+          existing[0].id
+        ]
+      );
+
+      await connection.commit();
+      return res.status(200).json({
+        success: true,
+        message: "Inventory updated successfully (external procurement)",
+        data: { id: existing[0].id, action: 'updated' }
+      });
+    } else {
+      // Insert new - First check/create item in inventory_warehouse for item_id
+      let warehouse_item_id = null;
+      
+      // Check if item exists in inventory_warehouse by item_code or item_name
+      if (item_code) {
+        const [existingWarehouse] = await connection.execute(
+          `SELECT id FROM inventory_warehouse WHERE item_code = ?`,
+          [item_code]
+        );
+        if (existingWarehouse.length > 0) {
+          warehouse_item_id = existingWarehouse[0].id;
+        }
+      }
+      
+      // If not found by code, check by name
+      if (!warehouse_item_id) {
+        const [existingWarehouseByName] = await connection.execute(
+          `SELECT id FROM inventory_warehouse WHERE item_name = ? AND category = ?`,
+          [item_name, category]
+        );
+        if (existingWarehouseByName.length > 0) {
+          warehouse_item_id = existingWarehouseByName[0].id;
+        }
+      }
+      
+      // If still not found, create new item in inventory_warehouse
+      if (!warehouse_item_id) {
+        const [warehouseResult] = await connection.execute(
+          `INSERT INTO inventory_warehouse 
+           (item_code, item_name, category, description, unit, quantity, reorder_level, item_cost, expiry_date, batch_number, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, NOW(), NOW())`,
+          [
+            item_code || `EXT-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+            item_name,
+            category,
+            description || null,
+            unit || 'units',
+            parseInt(reorder_level) || 0,
+            item_cost || null,
+            expiry_date || null,
+            batch_number || null
+          ]
+        );
+        warehouse_item_id = warehouseResult.insertId;
+      }
+      
+      // Now insert into inventory_facility with the warehouse_item_id
+      const [result] = await connection.execute(
+        `INSERT INTO inventory_facility 
+         (item_code, item_name, category, description, unit, facility_id, item_id, quantity, reorder_level, item_cost, expiry_date, batch_number, source_type, supplier_id, procurement_date, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'external', ?, ?, NOW(), NOW())`,
+        [
+          item_code || null,
+          item_name,
+          category,
+          description || null,
+          unit || 'units',
+          facility_id,
+          warehouse_item_id,
+          parseFloat(quantity) || 0,
+          parseInt(reorder_level) || 0,
+          item_cost || null,
+          expiry_date || null,
+          batch_number || null,
+          supplier_id || null,
+          procurement_date || null
+        ]
+      );
+
+      await connection.commit();
+      return res.status(201).json({
+        success: true,
+        message: "Inventory added successfully (external procurement)",
+        data: { id: result.insertId, action: 'created', warehouse_item_id: warehouse_item_id }
+      });
+    }
+  } catch (error) {
+    await connection.rollback();
+    console.error("Error in manual entry:", error);
+    res.status(500).json({
+      success: false,
+      message: "Error in manual entry",
+      error: error.message
+    });
+  } finally {
+    connection.release();
+  }
+};
+
 module.exports = {
   getInventory,
+  getWarehouseInventoryById,
   getInventoryById,
   createWarehouseInventory,
   updateInventoryItem,
@@ -838,5 +1226,7 @@ module.exports = {
   getInventoryByFacilityId,
   getInventoryByUserId,
   createWarehouseInventoryBulk,
-  createInventoryFacility
+  createInventoryFacility,
+  bulkImportInventory,
+  manualEntryInventory
 };

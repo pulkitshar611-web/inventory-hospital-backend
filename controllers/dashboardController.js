@@ -191,7 +191,7 @@ const getFacilityAdminDashboard = async (req, res) => {
 
     // 🔹 Step 3: Low stock items
     const [lowStockItems] = await connection.execute(`
-      SELECT item_code, item_name, category, quantity, reorder_level,
+      SELECT item_code, item_name, category, quantity, reorder_level, COALESCE(batch_number, 'N/A') as batch_number,
              (reorder_level - quantity) as shortage
       FROM inventory
       WHERE facility_id = ? AND quantity <= reorder_level
@@ -375,7 +375,7 @@ const getFacilityUserDashboard = async (req, res) => {
 
     // 🔹 Step 3: Available inventory items
     const [availableItems] = await connection.execute(`
-      SELECT item_code, item_name, category, quantity, unit,
+      SELECT item_code, item_name, category, quantity, unit, COALESCE(batch_number, 'N/A') as batch_number,
              CASE WHEN quantity > 0 THEN 'Available' ELSE 'Out of Stock' END as availability
       FROM inventory
       WHERE facility_id = ? AND quantity > 0

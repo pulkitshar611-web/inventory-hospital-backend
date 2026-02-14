@@ -129,7 +129,8 @@ const   requisitionSchemas = {
         priority: Joi.string()
           .valid('normal', 'high', 'urgent')
           .default('normal')
-          .optional()
+          .optional(),
+        estimated_usage_duration: Joi.number().integer().min(1).optional().allow(null)
       })
     ).min(1).required(),
 
@@ -142,14 +143,19 @@ const   requisitionSchemas = {
     remarks: Joi.any().optional(),
     facility_id: Joi.any().optional(),
     user_id: Joi.number().optional(),
+    estimated_usage_duration: Joi.number().integer().min(1).optional(),
   }),
 
   update: Joi.object({
     status: Joi.string()
       .valid('pending', 'processing', 'approved', 'rejected', 'dispatched', 'delivered', 'completed')
-      .required(),
+      .optional(),
     remarks: Joi.any().optional(),
     approved_quantity: Joi.any().optional(),
+    priority: Joi.string()
+      .valid('normal', 'high', 'urgent')
+      .optional(),
+    estimated_usage_duration: Joi.number().integer().min(1).optional().allow(null)
   })
 };
 
