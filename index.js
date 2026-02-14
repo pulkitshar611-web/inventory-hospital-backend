@@ -47,7 +47,8 @@ const allowedOrigins = [
   'https://resonant-kangaroo-a7cd11.netlify.app',
   'https://hospital-inventory2.netlify.app',
   'https://hospital-inventory-management-new.netlify.app',
-  'https://inventory.francisfosugroup.com'
+  'https://inventory.francisfosugroup.com',
+  'https://hospital-inventory.kiaantechnology.com'
 ];
 
 app.use(cors({
